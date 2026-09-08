@@ -52,6 +52,304 @@ const REWARDS = [
 
 
 // ========================================
+// TARIFS / LIMITES DE BILLETS
+// ========================================
+
+const TICKET_CONFIG = {
+  "Prévente": {
+    amount: 12.99,
+    limit: 30,
+  },
+
+  "Tarif normal": {
+    amount: 17.99,
+    limit: 140,
+  },
+
+  "Late": {
+    amount: 21.99,
+    limit: 30,
+  },
+};
+
+const TICKET_ORDER = [
+  "Prévente",
+  "Tarif normal",
+  "Late",
+];
+
+
+// ========================================
+// VERROU DES VENTES
+// ========================================
+//
+// Permet d'éviter que deux validations de paiement
+// simultanées dépassent la limite d'un tarif.
+//
+// Exemple :
+// 29 Early vendues
+// Deux validations arrivent en même temps
+// Une seule pourra prendre la 30e place.
+//
+
+let ticketSaleLock = Promise.resolve();
+
+async function withTicketSaleLock(fn) {
+  const previousLock = ticketSaleLock;
+
+  let releaseLock;
+
+  ticketSaleLock = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+
+  await previousLock;
+
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+  }
+}
+
+
+// ========================================
+// RÉCUPÉRER LES DISPONIBILITÉS
+// ========================================
+
+async function getTicketAvailability() {
+  const tickets = {};
+
+  for (const ticketName of TICKET_ORDER) {
+    const {
+      count,
+      error,
+    } = await supabase
+      .from("Participants")
+      .select("id", {
+        count: "exact",
+        head: true,
+      })
+      .eq(
+        "statut_paiement",
+        "paye"
+      )
+      .eq(
+        "tarif",
+        ticketName
+      );
+
+    if (error) {
+      throw error;
+    }
+
+    const sold = count || 0;
+
+    const limit =
+      TICKET_CONFIG[ticketName].limit;
+
+    tickets[ticketName] = {
+      sold,
+      limit,
+      remaining:
+        Math.max(
+          limit - sold,
+          0
+        ),
+    };
+  }
+
+  return tickets;
+}
+
+
+// ========================================
+// VÉRIFIER DISPONIBILITÉ D'UN TARIF
+// ========================================
+
+function checkTicketAvailability(
+  tarif,
+  tickets
+) {
+  if (!TICKET_CONFIG[tarif]) {
+    return {
+      ok: false,
+      error: "Tarif invalide.",
+    };
+  }
+
+  const current =
+    tickets[tarif];
+
+  // Tarif complet
+  if (
+    !current ||
+    current.sold >= current.limit
+  ) {
+    return {
+      ok: false,
+      error:
+        `Le tarif ${tarif} est SOLD OUT.`,
+      soldOut: true,
+    };
+  }
+
+  const index =
+    TICKET_ORDER.indexOf(
+      tarif
+    );
+
+  // Vérifier que le tarif précédent
+  // est bien terminé
+  if (index > 0) {
+    const previousTicket =
+      TICKET_ORDER[index - 1];
+
+    const previous =
+      tickets[previousTicket];
+
+    if (
+      !previous ||
+      previous.sold <
+        previous.limit
+    ) {
+      return {
+        ok: false,
+        error:
+          `Le tarif ${tarif} n'est pas encore disponible.`,
+        locked: true,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+  };
+}
+
+
+// ========================================
+// VALIDER RÉELLEMENT UNE PLACE
+// ========================================
+//
+// Cette fonction est utilisée au moment où
+// l'administrateur valide le paiement.
+//
+// Elle vérifie à nouveau la disponibilité
+// juste avant de passer le billet en "paye".
+//
+
+async function reserveTicketSlot(
+  participantId,
+  tarif
+) {
+  return withTicketSaleLock(
+    async () => {
+
+      const tickets =
+        await getTicketAvailability();
+
+      const availability =
+        checkTicketAvailability(
+          tarif,
+          tickets
+        );
+
+      if (!availability.ok) {
+        return {
+          ok: false,
+          ...availability,
+          tickets,
+        };
+      }
+
+      // ========================================
+      // GÉNÉRER CODE BILLET
+      // ========================================
+
+      let billetCode = null;
+      let billetUnique = false;
+
+      while (!billetUnique) {
+
+        billetCode =
+          generateTicketCode();
+
+        const {
+          data: existingTicket,
+          error:
+            ticketCheckError,
+        } = await supabase
+          .from("Participants")
+          .select("id")
+          .eq(
+            "billet_code",
+            billetCode
+          )
+          .maybeSingle();
+
+        if (ticketCheckError) {
+          throw ticketCheckError;
+        }
+
+        if (!existingTicket) {
+          billetUnique = true;
+        }
+      }
+
+      // ========================================
+      // VALIDER LE PAIEMENT
+      // ========================================
+
+      const {
+        data: updatedParticipant,
+        error: updateError,
+      } = await supabase
+        .from("Participants")
+        .update({
+          statut_paiement:
+            "paye",
+
+          billet_code:
+            billetCode,
+
+          billet_utilise:
+            false,
+
+          billet_utilise_at:
+            null,
+        })
+        .eq(
+          "id",
+          participantId
+        )
+        .eq(
+          "statut_paiement",
+          "en_attente"
+        )
+        .select()
+        .single();
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      return {
+        ok: true,
+
+        participant:
+          updatedParticipant,
+
+        billetCode,
+
+        tickets,
+      };
+    }
+  );
+}
+
+
+// ========================================
 // GÉNÉRER CODE PARRAINAGE
 // ========================================
 
@@ -64,7 +362,8 @@ function generateReferralCode() {
   for (let i = 0; i < 6; i++) {
     code += characters.charAt(
       Math.floor(
-        Math.random() * characters.length
+        Math.random() *
+          characters.length
       )
     );
   }
@@ -86,7 +385,8 @@ function generateTicketCode() {
   for (let i = 0; i < 10; i++) {
     code += characters.charAt(
       Math.floor(
-        Math.random() * characters.length
+        Math.random() *
+          characters.length
       )
     );
   }
@@ -99,12 +399,23 @@ function generateTicketCode() {
 // VÉRIFIER PIN ADMIN
 // ========================================
 
-function checkAdminPin(req, res, next) {
-  const pin = req.headers["x-admin-pin"];
+function checkAdminPin(
+  req,
+  res,
+  next
+) {
+  const pin =
+    req.headers[
+      "x-admin-pin"
+    ];
 
-  if (!ADMIN_PIN || pin !== ADMIN_PIN) {
+  if (
+    !ADMIN_PIN ||
+    pin !== ADMIN_PIN
+  ) {
     return res.status(401).json({
-      error: "Accès administrateur refusé.",
+      error:
+        "Accès administrateur refusé.",
     });
   }
 
@@ -121,6 +432,7 @@ app.post(
   "/register-account",
   async (req, res) => {
     try {
+
       const {
         prenom,
         nom,
@@ -149,7 +461,9 @@ app.post(
         nom.trim();
 
       const cleanMail =
-        mail.trim().toLowerCase();
+        mail
+          .trim()
+          .toLowerCase();
 
       const cleanTelephone =
         telephone.trim();
@@ -157,24 +471,34 @@ app.post(
       const cleanPassword =
         password.trim();
 
-      if (cleanPassword.length < 4) {
+      if (
+        cleanPassword.length < 4
+      ) {
         return res.status(400).json({
           error:
             "Le mot de passe doit contenir au moins 4 caractères.",
         });
       }
 
-      // Vérifier email
+
+      // ========================================
+      // VÉRIFIER EMAIL
+      // ========================================
+
       const {
         data: existingEmail,
         error: emailError,
       } = await supabase
         .from("Participants")
         .select("id")
-        .ilike("mail", cleanMail)
+        .ilike(
+          "mail",
+          cleanMail
+        )
         .maybeSingle();
 
       if (emailError) {
+
         console.error(
           "Erreur vérification email :",
           emailError
@@ -193,17 +517,25 @@ app.post(
         });
       }
 
-      // Vérifier téléphone
+
+      // ========================================
+      // VÉRIFIER TÉLÉPHONE
+      // ========================================
+
       const {
         data: existingPhone,
         error: phoneError,
       } = await supabase
         .from("Participants")
         .select("id")
-        .eq("telephone", cleanTelephone)
+        .eq(
+          "telephone",
+          cleanTelephone
+        )
         .maybeSingle();
 
       if (phoneError) {
+
         console.error(
           "Erreur vérification téléphone :",
           phoneError
@@ -222,11 +554,16 @@ app.post(
         });
       }
 
-      // Générer code personnel
+
+      // ========================================
+      // GÉNÉRER CODE PERSONNEL
+      // ========================================
+
       let nouveauCode = null;
       let codeUnique = false;
 
       while (!codeUnique) {
+
         nouveauCode =
           generateReferralCode();
 
@@ -243,6 +580,7 @@ app.post(
           .maybeSingle();
 
         if (checkError) {
+
           console.error(
             "Erreur génération code :",
             checkError
@@ -259,7 +597,11 @@ app.post(
         }
       }
 
-      // Créer le compte
+
+      // ========================================
+      // CRÉER COMPTE
+      // ========================================
+
       const {
         data: participant,
         error: insertError,
@@ -267,20 +609,32 @@ app.post(
         .from("Participants")
         .insert([
           {
-            prenom: cleanPrenom,
-            nom: cleanNom,
-            mail: cleanMail,
-            telephone: cleanTelephone,
-            password: cleanPassword,
+            prenom:
+              cleanPrenom,
 
-            // Pas encore de billet
-            tarif: null,
-            montant: null,
+            nom:
+              cleanNom,
+
+            mail:
+              cleanMail,
+
+            telephone:
+              cleanTelephone,
+
+            password:
+              cleanPassword,
+
+            tarif:
+              null,
+
+            montant:
+              null,
 
             statut_paiement:
               "en_attente",
 
-            parrain_code: null,
+            parrain_code:
+              null,
 
             code_parrain:
               nouveauCode,
@@ -290,6 +644,7 @@ app.post(
         .single();
 
       if (insertError) {
+
         console.error(
           "Erreur création compte :",
           insertError
@@ -298,10 +653,12 @@ app.post(
         return res.status(500).json({
           error:
             "Impossible de créer le compte.",
+
           details:
             insertError.message,
         });
       }
+
 
       console.log(
         "================================"
@@ -336,12 +693,14 @@ app.post(
         "================================"
       );
 
+
       return res.json({
         success: true,
         participant,
       });
 
     } catch (error) {
+
       console.error(
         "Erreur création compte :",
         error
@@ -350,6 +709,7 @@ app.post(
       return res.status(500).json({
         error:
           "Erreur serveur.",
+
         details:
           error.message,
       });
@@ -367,12 +727,16 @@ app.post(
   "/login",
   async (req, res) => {
     try {
+
       const {
         login,
         password,
       } = req.body;
 
-      if (!login || !password) {
+      if (
+        !login ||
+        !password
+      ) {
         return res.status(400).json({
           error:
             "Identifiant et mot de passe requis.",
@@ -387,7 +751,11 @@ app.post(
 
       let participant = null;
 
-      // Recherche par email
+
+      // ========================================
+      // RECHERCHE PAR EMAIL
+      // ========================================
+
       const {
         data: participantByEmail,
         error: emailError,
@@ -401,6 +769,7 @@ app.post(
         .maybeSingle();
 
       if (emailError) {
+
         console.error(
           "Erreur recherche email :",
           emailError
@@ -417,9 +786,13 @@ app.post(
           participantByEmail;
       }
 
-      // Si pas trouvé par email,
-      // recherche par téléphone
+
+      // ========================================
+      // RECHERCHE PAR TÉLÉPHONE
+      // ========================================
+
       if (!participant) {
+
         const {
           data: participantByPhone,
           error: phoneError,
@@ -433,6 +806,7 @@ app.post(
           .maybeSingle();
 
         if (phoneError) {
+
           console.error(
             "Erreur recherche téléphone :",
             phoneError
@@ -450,7 +824,11 @@ app.post(
         }
       }
 
-      // Aucun compte
+
+      // ========================================
+      // AUCUN COMPTE
+      // ========================================
+
       if (!participant) {
         return res.status(401).json({
           error:
@@ -458,7 +836,11 @@ app.post(
         });
       }
 
-      // Vérification mot de passe
+
+      // ========================================
+      // MOT DE PASSE
+      // ========================================
+
       if (
         participant.password !==
         cleanPassword
@@ -468,6 +850,7 @@ app.post(
             "Mot de passe incorrect.",
         });
       }
+
 
       console.log(
         "================================"
@@ -487,12 +870,14 @@ app.post(
         "================================"
       );
 
+
       return res.json({
         success: true,
         participant,
       });
 
     } catch (error) {
+
       console.error(
         "Erreur connexion :",
         error
@@ -501,8 +886,46 @@ app.post(
       return res.status(500).json({
         error:
           "Erreur serveur.",
+
         details:
           error.message,
+      });
+    }
+  }
+);
+
+
+// ========================================
+// BILLETS
+// DISPONIBILITÉ DES TARIFS
+// ========================================
+
+app.get(
+  "/ticket-availability",
+  async (req, res) => {
+
+    try {
+
+      const tickets =
+        await getTicketAvailability();
+
+      return res.json({
+        success: true,
+        tickets,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Erreur disponibilité billets :",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+
+        error:
+          "Impossible de récupérer les disponibilités.",
       });
     }
   }
@@ -517,7 +940,9 @@ app.post(
 app.post(
   "/register-participant",
   async (req, res) => {
+
     try {
+
       const {
         prenom,
         nom,
@@ -528,6 +953,11 @@ app.post(
         code_parrain,
         password,
       } = req.body;
+
+
+      // ========================================
+      // VÉRIFICATION CHAMPS
+      // ========================================
 
       if (
         !prenom ||
@@ -558,11 +988,42 @@ app.post(
         });
       }
 
+
+      // ========================================
+      // VÉRIFIER TARIF + MONTANT
+      // ========================================
+
+      if (
+        !TICKET_CONFIG[tarif]
+      ) {
+        return res.status(400).json({
+          error:
+            "Tarif invalide.",
+        });
+      }
+
+      const expectedAmount =
+        TICKET_CONFIG[tarif].amount;
+
+      if (
+        Number(montant) !==
+        expectedAmount
+      ) {
+        return res.status(400).json({
+          error:
+            "Le montant ne correspond pas au tarif sélectionné.",
+        });
+      }
+
+
       const cleanMail =
-        mail.trim().toLowerCase();
+        mail
+          .trim()
+          .toLowerCase();
 
       const cleanTelephone =
         telephone.trim();
+
 
       // ========================================
       // RECHERCHER COMPTE EXISTANT
@@ -581,6 +1042,7 @@ app.post(
         .maybeSingle();
 
       if (existingError) {
+
         console.error(
           "Erreur recherche participant :",
           existingError
@@ -592,17 +1054,24 @@ app.post(
         });
       }
 
+
       // ========================================
       // COMPTE EXISTANT
       // ========================================
 
-      if (existingParticipant) {
+      if (
+        existingParticipant
+      ) {
 
         let codeParrainFinal =
           existingParticipant.parrain_code ||
           null;
 
-        // Vérifier nouveau code parrain
+
+        // ========================================
+        // VÉRIFIER CODE PARRAIN
+        // ========================================
+
         if (code_parrain) {
 
           const code =
@@ -625,6 +1094,7 @@ app.post(
             .maybeSingle();
 
           if (parrainError) {
+
             console.error(
               "Erreur recherche parrain :",
               parrainError
@@ -643,7 +1113,11 @@ app.post(
             });
           }
 
+
+          // ========================================
           // BLOQUER AUTO-PARRAINAGE
+          // ========================================
+
           const parrainMail =
             parrain.mail
               ?.trim()
@@ -656,13 +1130,16 @@ app.post(
           if (
             (
               parrainMail &&
-              parrainMail === cleanMail
+              parrainMail ===
+                cleanMail
             ) ||
             (
               parrainTelephone &&
-              parrainTelephone === cleanTelephone
+              parrainTelephone ===
+                cleanTelephone
             )
           ) {
+
             return res.status(400).json({
               error:
                 "Tu ne peux pas utiliser ton propre code de parrainage.",
@@ -673,7 +1150,13 @@ app.post(
             code;
         }
 
+
+        // ========================================
+        // MISE À JOUR COMPTE
+        // ========================================
+
         const updateData = {
+
           prenom:
             prenom.trim(),
 
@@ -696,15 +1179,20 @@ app.post(
             codeParrainFinal,
         };
 
-        // Si le compte n'a pas de mot de passe,
-        // on peut lui en créer un au moment de l'achat
+
+        // ========================================
+        // PASSWORD
+        // ========================================
+
         if (
           password &&
           !existingParticipant.password
         ) {
+
           updateData.password =
             password.trim();
         }
+
 
         const {
           data: updatedParticipant,
@@ -720,6 +1208,7 @@ app.post(
           .single();
 
         if (updateError) {
+
           console.error(
             "Erreur mise à jour participant :",
             updateError
@@ -728,12 +1217,17 @@ app.post(
           return res.status(500).json({
             error:
               "Impossible d'enregistrer le billet.",
+
             details:
               updateError.message,
           });
         }
 
-        // Créer parrainage
+
+        // ========================================
+        // CRÉER PARRAINAGE
+        // ========================================
+
         if (codeParrainFinal) {
 
           const {
@@ -751,7 +1245,9 @@ app.post(
             )
             .maybeSingle();
 
-          if (!existingParrainage) {
+          if (
+            !existingParrainage
+          ) {
 
             await supabase
               .from("Parrainages")
@@ -779,22 +1275,29 @@ app.post(
           }
         }
 
+
         return res.json({
           success: true,
+
           participant:
             updatedParticipant,
+
           code_parrain:
             updatedParticipant.code_parrain,
+
           parrain_code:
             updatedParticipant.parrain_code,
         });
       }
 
+
       // ========================================
       // NOUVEAU PARTICIPANT
       // ========================================
 
-      let codeParrainFinal = null;
+      let codeParrainFinal =
+        null;
+
 
       if (code_parrain) {
 
@@ -818,6 +1321,7 @@ app.post(
           .maybeSingle();
 
         if (parrainError) {
+
           console.error(
             "Erreur recherche parrain :",
             parrainError
@@ -836,7 +1340,11 @@ app.post(
           });
         }
 
+
+        // ========================================
         // BLOQUER AUTO-PARRAINAGE
+        // ========================================
+
         const parrainMail =
           parrain.mail
             ?.trim()
@@ -849,13 +1357,16 @@ app.post(
         if (
           (
             parrainMail &&
-            parrainMail === cleanMail
+            parrainMail ===
+              cleanMail
           ) ||
           (
             parrainTelephone &&
-            parrainTelephone === cleanTelephone
+            parrainTelephone ===
+              cleanTelephone
           )
         ) {
+
           return res.status(400).json({
             error:
               "Tu ne peux pas utiliser ton propre code de parrainage.",
@@ -866,7 +1377,11 @@ app.post(
           code;
       }
 
-      // Générer code personnel
+
+      // ========================================
+      // GÉNÉRER CODE PERSONNEL
+      // ========================================
+
       let nouveauCode = null;
       let codeUnique = false;
 
@@ -888,6 +1403,7 @@ app.post(
           .maybeSingle();
 
         if (checkError) {
+
           return res.status(500).json({
             error:
               "Impossible de générer le code de parrainage.",
@@ -898,6 +1414,11 @@ app.post(
           codeUnique = true;
         }
       }
+
+
+      // ========================================
+      // CRÉER PARTICIPANT
+      // ========================================
 
       const {
         data,
@@ -942,7 +1463,9 @@ app.post(
         .select()
         .single();
 
+
       if (error) {
+
         console.error(
           "Erreur Supabase :",
           error
@@ -951,12 +1474,17 @@ app.post(
         return res.status(500).json({
           error:
             "Impossible d'enregistrer le participant.",
+
           details:
             error.message,
         });
       }
 
-      // Créer parrainage
+
+      // ========================================
+      // CRÉER PARRAINAGE
+      // ========================================
+
       if (codeParrainFinal) {
 
         await supabase
@@ -984,6 +1512,7 @@ app.post(
           ]);
       }
 
+
       return res.json({
         success: true,
 
@@ -1007,12 +1536,16 @@ app.post(
       return res.status(500).json({
         error:
           "Erreur serveur.",
+
         details:
           error.message,
       });
     }
   }
-);// ========================================
+);
+
+
+// ========================================
 // COMPTE
 // RÉCUPÉRER PAR EMAIL
 // ========================================
@@ -1064,6 +1597,7 @@ app.get(
         .maybeSingle();
 
       if (error) {
+
         console.error(
           "Erreur compte email :",
           error
@@ -1151,6 +1685,7 @@ app.get(
         .maybeSingle();
 
       if (error) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer ton compte.",
@@ -1215,11 +1750,13 @@ app.get(
         .order(
           "id",
           {
-            ascending: false,
+            ascending:
+              false,
           }
         );
 
       if (error) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer les participants.",
@@ -1266,6 +1803,11 @@ app.post(
         });
       }
 
+
+      // ========================================
+      // RÉCUPÉRER PARTICIPANT
+      // ========================================
+
       const {
         data: participant,
         error: participantError,
@@ -1276,6 +1818,8 @@ app.post(
           prenom,
           nom,
           mail,
+          tarif,
+          montant,
           statut_paiement,
           parrain_code
         `)
@@ -1286,6 +1830,7 @@ app.post(
         .maybeSingle();
 
       if (participantError) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer le participant.",
@@ -1293,118 +1838,97 @@ app.post(
       }
 
       if (!participant) {
+
         return res.status(404).json({
           error:
             "Participant introuvable.",
         });
       }
 
+
+      // ========================================
+      // DÉJÀ PAYÉ
+      // ========================================
+
       if (
         participant.statut_paiement ===
         "paye"
       ) {
+
         return res.status(400).json({
           error:
             "Ce paiement est déjà validé.",
         });
       }
 
-      // ========================================
-      // GÉNÉRER LE BILLET
-      // ========================================
-
-      let billetCode = null;
-      let billetUnique = false;
-
-      while (!billetUnique) {
-
-        billetCode =
-          generateTicketCode();
-
-        const {
-          data: existingTicket,
-          error: ticketCheckError,
-        } = await supabase
-          .from("Participants")
-          .select("id")
-          .eq(
-            "billet_code",
-            billetCode
-          )
-          .maybeSingle();
-
-        if (ticketCheckError) {
-
-          console.error(
-            "Erreur vérification billet :",
-            ticketCheckError
-          );
-
-          return res.status(500).json({
-            error:
-              "Impossible de générer le billet.",
-          });
-        }
-
-        if (!existingTicket) {
-          billetUnique = true;
-        }
-      }
 
       // ========================================
-      // VALIDER PAIEMENT + CRÉER BILLET
+      // VÉRIFIER LIMITE + VALIDER BILLET
       // ========================================
 
-      const {
-        data: updatedParticipant,
-        error: updateError,
-      } = await supabase
-        .from("Participants")
-        .update({
-          statut_paiement:
-            "paye",
+      const saleResult =
+        await reserveTicketSlot(
+          participant.id,
+          participant.tarif
+        );
 
-          billet_code:
-            billetCode,
 
-          billet_utilise:
+      // ========================================
+      // TARIF SOLD OUT / BLOQUÉ
+      // ========================================
+
+      if (!saleResult.ok) {
+
+        return res.status(400).json({
+
+          error:
+            saleResult.error,
+
+          soldOut:
+            saleResult.soldOut ||
             false,
 
-          billet_utilise_at:
+          locked:
+            saleResult.locked ||
+            false,
+
+          tickets:
+            saleResult.tickets ||
             null,
-        })
-        .eq(
-          "id",
-          participantId
-        )
-        .select()
-        .single();
-
-      if (updateError) {
-
-        return res.status(500).json({
-          error:
-            "Impossible de valider le paiement.",
         });
       }
+
+
+      const updatedParticipant =
+        saleResult.participant;
+
+      const billetCode =
+        saleResult.billetCode;
+
 
       let parrainageValide =
         false;
 
-      let codeParrain = null;
+      let codeParrain =
+        null;
 
-      let referralsCount = 0;
+      let referralsCount =
+        0;
 
       let parrainParticipant =
         null;
 
-      let rewardsCreated = [];
+      let rewardsCreated =
+        [];
+
 
       // ========================================
       // VALIDER PARRAINAGE
       // ========================================
 
-      if (participant.parrain_code) {
+      if (
+        participant.parrain_code
+      ) {
 
         codeParrain =
           participant.parrain_code
@@ -1421,10 +1945,12 @@ app.post(
             codeParrain
           );
 
+
         const mailParticipant =
           participant.mail
             .trim()
             .toLowerCase();
+
 
         const parrainage =
           parrainages?.find(
@@ -1434,6 +1960,7 @@ app.post(
                 .toLowerCase() ===
               mailParticipant
           );
+
 
         if (parrainage) {
 
@@ -1464,12 +1991,14 @@ app.post(
             if (
               !parrainageUpdateError
             ) {
+
               parrainageValide =
                 true;
             }
           }
         }
       }
+
 
       // ========================================
       // TROUVER PARRAIN
@@ -1497,6 +2026,7 @@ app.post(
           parrain;
       }
 
+
       // ========================================
       // COMPTER FILLEULS
       // ========================================
@@ -1512,6 +2042,7 @@ app.post(
             {
               count:
                 "exact",
+
               head:
                 true,
             }
@@ -1528,6 +2059,7 @@ app.post(
         referralsCount =
           count || 0;
       }
+
 
       // ========================================
       // CRÉER RÉCOMPENSES
@@ -1548,7 +2080,8 @@ app.post(
           ) {
 
             const {
-              data: existingReward,
+              data:
+                existingReward,
             } = await supabase
               .from("Recompenses")
               .select(
@@ -1564,10 +2097,14 @@ app.post(
               )
               .maybeSingle();
 
-            if (!existingReward) {
+
+            if (
+              !existingReward
+            ) {
 
               const {
-                data: newReward,
+                data:
+                  newReward,
               } = await supabase
                 .from("Recompenses")
                 .insert([
@@ -1589,6 +2126,7 @@ app.post(
                 .single();
 
               if (newReward) {
+
                 rewardsCreated.push(
                   newReward
                 );
@@ -1598,7 +2136,47 @@ app.post(
         }
       }
 
+
+      // ========================================
+      // LOG
+      // ========================================
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        "PAIEMENT VALIDÉ"
+      );
+
+      console.log(
+        "Participant :",
+        updatedParticipant.prenom,
+        updatedParticipant.nom
+      );
+
+      console.log(
+        "Tarif :",
+        updatedParticipant.tarif
+      );
+
+      console.log(
+        "Montant :",
+        updatedParticipant.montant
+      );
+
+      console.log(
+        "Billet :",
+        billetCode
+      );
+
+      console.log(
+        "================================"
+      );
+
+
       return res.json({
+
         success:
           true,
 
@@ -1634,7 +2212,10 @@ app.post(
       });
     }
   }
-);// ========================================
+);
+
+
+// ========================================
 // PARRAINAGE
 // ========================================
 
@@ -1650,11 +2231,13 @@ app.get(
           .toUpperCase();
 
       if (!code) {
+
         return res.status(400).json({
           error:
             "Code de parrainage manquant.",
         });
       }
+
 
       const {
         count,
@@ -1666,6 +2249,7 @@ app.get(
           {
             count:
               "exact",
+
             head:
               true,
           }
@@ -1679,12 +2263,15 @@ app.get(
           true
         );
 
+
       if (error) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer les parrainages.",
         });
       }
+
 
       return res.json({
         success:
@@ -1721,15 +2308,18 @@ app.get(
           .toUpperCase();
 
       if (!code) {
+
         return res.status(400).json({
           error:
             "Code de parrainage manquant.",
         });
       }
 
+
       const {
         data: participant,
-        error: participantError,
+        error:
+          participantError,
       } = await supabase
         .from("Participants")
         .select(`
@@ -1744,23 +2334,29 @@ app.get(
         )
         .maybeSingle();
 
+
       if (participantError) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer le participant.",
         });
       }
 
+
       if (!participant) {
+
         return res.status(404).json({
           error:
             "Code de parrainage introuvable.",
         });
       }
 
+
       const {
         data: rewards,
-        error: rewardsError,
+        error:
+          rewardsError,
       } = await supabase
         .from("Recompenses")
         .select(`
@@ -1779,16 +2375,20 @@ app.get(
         .order(
           "palier",
           {
-            ascending: true,
+            ascending:
+              true,
           }
         );
 
+
       if (rewardsError) {
+
         return res.status(500).json({
           error:
             "Impossible de récupérer les récompenses.",
         });
       }
+
 
       return res.json({
         success:
@@ -1803,6 +2403,7 @@ app.get(
       return res.status(500).json({
         error:
           "Erreur serveur.",
+
         details:
           error.message,
       });
@@ -1820,6 +2421,7 @@ app.post(
   "/admin/scan-ticket",
   checkAdminPin,
   async (req, res) => {
+
     try {
 
       const code =
@@ -1828,15 +2430,22 @@ app.post(
           .toUpperCase();
 
       if (!code) {
+
         return res.status(400).json({
           error:
             "Code billet manquant.",
         });
       }
 
+
+      // ========================================
+      // RECHERCHER BILLET
+      // ========================================
+
       const {
         data: participant,
-        error: participantError,
+        error:
+          participantError,
       } = await supabase
         .from("Participants")
         .select(`
@@ -1858,6 +2467,7 @@ app.post(
         )
         .maybeSingle();
 
+
       if (participantError) {
 
         console.error(
@@ -1871,12 +2481,19 @@ app.post(
         });
       }
 
+
       if (!participant) {
+
         return res.status(404).json({
           error:
             "Billet invalide ou introuvable.",
         });
       }
+
+
+      // ========================================
+      // VÉRIFIER PAIEMENT
+      // ========================================
 
       if (
         participant.statut_paiement !==
@@ -1886,15 +2503,23 @@ app.post(
         return res.status(400).json({
           error:
             "Ce billet n'est pas encore payé.",
+
           participant,
         });
       }
 
+
+      // ========================================
+      // DÉJÀ UTILISÉ
+      // ========================================
+
       if (
-        participant.billet_utilise === true
+        participant.billet_utilise ===
+        true
       ) {
 
         return res.status(400).json({
+
           error:
             "Ce billet a déjà été utilisé.",
 
@@ -1904,6 +2529,11 @@ app.post(
           participant,
         });
       }
+
+
+      // ========================================
+      // VALIDER ENTRÉE
+      // ========================================
 
       const {
         data: updatedParticipant,
@@ -1940,6 +2570,7 @@ app.post(
         `)
         .maybeSingle();
 
+
       if (updateError) {
 
         console.error(
@@ -1953,9 +2584,11 @@ app.post(
         });
       }
 
+
       if (!updatedParticipant) {
 
         return res.status(400).json({
+
           error:
             "Ce billet vient déjà d'être utilisé.",
 
@@ -1965,6 +2598,7 @@ app.post(
           participant,
         });
       }
+
 
       console.log(
         "================================"
@@ -1989,7 +2623,9 @@ app.post(
         "================================"
       );
 
+
       return res.json({
+
         success:
           true,
 
@@ -2033,7 +2669,8 @@ app.get(
 
       const {
         data: rewards,
-        error: rewardsError,
+        error:
+          rewardsError,
       } = await supabase
         .from("Recompenses")
         .select(`
@@ -2048,9 +2685,11 @@ app.get(
         .order(
           "palier",
           {
-            ascending: true,
+            ascending:
+              true,
           }
         );
+
 
       if (rewardsError) {
 
@@ -2059,6 +2698,7 @@ app.get(
             "Impossible de récupérer les récompenses.",
         });
       }
+
 
       const participantIds =
         [
@@ -2071,11 +2711,14 @@ app.get(
           ),
         ];
 
+
       let participantsMap =
         {};
 
+
       if (
-        participantIds.length > 0
+        participantIds.length >
+        0
       ) {
 
         const {
@@ -2093,8 +2736,10 @@ app.get(
             participantIds
           );
 
+
         (
-          participants || []
+          participants ||
+          []
         ).forEach(
           participant => {
 
@@ -2109,11 +2754,14 @@ app.get(
         );
       }
 
+
       const finalRewards =
         (
-          rewards || []
+          rewards ||
+          []
         ).map(
           reward => ({
+
             ...reward,
 
             participant:
@@ -2121,11 +2769,14 @@ app.get(
                 String(
                   reward.participant_id
                 )
-              ] || null,
+              ] ||
+              null,
           })
         );
 
+
       return res.json({
+
         success:
           true,
 
@@ -2164,15 +2815,18 @@ app.post(
       } = req.body;
 
       if (!rewardId) {
+
         return res.status(400).json({
           error:
             "Récompense manquante.",
         });
       }
 
+
       const {
         data: reward,
-        error: rewardError,
+        error:
+          rewardError,
       } = await supabase
         .from("Recompenses")
         .select(`
@@ -2188,6 +2842,7 @@ app.post(
         )
         .maybeSingle();
 
+
       if (rewardError) {
 
         return res.status(500).json({
@@ -2196,6 +2851,7 @@ app.post(
         });
       }
 
+
       if (!reward) {
 
         return res.status(404).json({
@@ -2203,6 +2859,7 @@ app.post(
             "Récompense introuvable.",
         });
       }
+
 
       if (
         reward.statut ===
@@ -2214,6 +2871,7 @@ app.post(
             "Cette récompense a déjà été remise.",
         });
       }
+
 
       const {
         data: updatedReward,
@@ -2234,9 +2892,11 @@ app.post(
         .select()
         .single();
 
+
       if (updateError) {
 
         return res.status(500).json({
+
           error:
             "Impossible de valider la remise de la récompense.",
 
@@ -2245,7 +2905,9 @@ app.post(
         });
       }
 
+
       return res.json({
+
         success:
           true,
 
@@ -2264,7 +2926,10 @@ app.post(
       });
     }
   }
-);// ========================================
+);
+
+
+// ========================================
 // TEST SERVEUR
 // ========================================
 
@@ -2273,6 +2938,7 @@ app.get(
   (req, res) => {
 
     res.json({
+
       success:
         true,
 
@@ -2288,7 +2954,9 @@ app.get(
 // SERVEUR
 // ========================================
 
-const PORT = 3000;
+const PORT =
+  process.env.PORT ||
+  3000;
 
 app.listen(
   PORT,
