@@ -1,14 +1,14 @@
-import React, { useCallback, useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
-    Alert,
-    ImageBackground,
-    SafeAreaView,
-    ScrollView,
-    Share,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  Alert,
+  ImageBackground,
+  SafeAreaView,
+  ScrollView,
+  Share,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 
 import { useFocusEffect } from 'expo-router';
@@ -22,7 +22,7 @@ import FlyingBats from '../../components/FlyingBats';
 // SERVEUR
 // ========================================
 
-const SERVER_URL = 'http://192.168.1.12:3000';
+const SERVER_URL = 'https://tnlp-server.onrender.com';
 
 
 // ========================================

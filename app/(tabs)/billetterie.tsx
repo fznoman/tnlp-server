@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import {
   Alert,
   ImageBackground,
@@ -25,8 +25,8 @@ const API_URL = "https://tnlp-server.onrender.com";
 const TICKETS = [
   {
     name: "Prévente",
-    price: "11,99 €",
-    amount: 11.99,
+    price: "12,99 €",
+    amount: 12.99,
     description:
       "Le meilleur tarif, disponible en quantité limitée",
     link: "https://pay.sumup.com/b2c/XNXP0POQMF",
